@@ -204,7 +204,7 @@ export interface SparkRendererOptions {
    * @default false
    */
   lodInflate?: boolean;
-  lodTraverseMode?: "dynamic" | "standard";
+  lodTraverseMode?: "dynamic" | "macro" | "standard";
   /**
    * Whether to use extended Gsplat encoding for paged splats, useful for eliminating
    * quantization artifacts from splat scenes with large internal position coordinates.
@@ -372,6 +372,7 @@ export class SparkRenderer extends THREE.Mesh {
   lastSortTime = 0;
   sortWorker: SplatWorker | null = null;
   sortTimeoutId = -1;
+  lastLodDebugLogTime = 0;
   sortedCenter = new THREE.Vector3().setScalar(Number.NEGATIVE_INFINITY);
   sortedDir = new THREE.Vector3().setScalar(0);
   readback32 = new Uint32Array(0);
@@ -383,7 +384,7 @@ export class SparkRenderer extends THREE.Mesh {
   lodSplatScale: number;
   lodRenderScale: number;
   lodInflate: boolean;
-  lodTraverseMode: "dynamic" | "standard";
+  lodTraverseMode: "dynamic" | "macro" | "standard";
   pagedExtSplats: boolean;
   maxPagedSplats: number;
   numLodFetchers: number;
@@ -1374,6 +1375,16 @@ export class SparkRenderer extends THREE.Mesh {
       const { lodId } = (await worker.call("newSharedLodTree", {
         lodId: this.pagerId,
       })) as { lodId: number };
+      const macroIndex = await splats.getMacroIndex();
+      if (macroIndex) {
+        const macroDebug = (await worker.call("setLodMacroIndex", {
+          lodId,
+          macroIndex,
+        })) as { macroUnits: number; macroPageRefs: number };
+        console.info(
+          `[Spark LoD] macro index loaded lodId=${lodId} bytes=${macroIndex.byteLength} units=${macroDebug.macroUnits} pageRefs=${macroDebug.macroPageRefs}`,
+        );
+      }
       this.lodIds.set(splats, { lodId, lastTouched: performance.now() });
       this.lodIdToSplats.set(lodId, splats);
       // console.log("*** newSharedLodTree", lodId, this.pagerId, splats);
@@ -1468,18 +1479,28 @@ export class SparkRenderer extends THREE.Mesh {
       >;
       chunks: [number, number][];
       pixelLimit?: number;
+      debug?: Record<string, number | undefined>;
     };
     this.lastTraverseTime = performance.now() - traverseStart;
 
-    const { keyIndices, chunks, pixelLimit } = result;
+    const { keyIndices, chunks, pixelLimit, debug } = result;
     this.lastPixelLimit = pixelLimit;
     const totalLodSplats = Object.values(keyIndices).reduce(
       (sum, { numSplats }) => sum + numSplats,
       0,
     );
-    // console.log(
-    //   `traverseLodTrees in ${this.lastTraverseTime} ms, pixelLimit=${pixelLimit}, totalLodSplats=${totalLodSplats}`,
-    // );
+    const now = performance.now();
+    if (now - this.lastLodDebugLogTime > 1000) {
+      this.lastLodDebugLogTime = now;
+      console.debug("[Spark LoD] traversal", {
+        mode: this.lodTraverseMode,
+        ms: this.lastTraverseTime,
+        pixelLimit,
+        totalLodSplats,
+        chunks: chunks.length,
+        ...debug,
+      });
+    }
 
     this.updateLodIndices(uuidToMesh, keyIndices);
     // console.log("chunks.length =", chunks.length);

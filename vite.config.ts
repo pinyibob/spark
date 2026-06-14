@@ -124,6 +124,9 @@ export default defineConfig(({ mode }) => {
       watch: {
         usePolling: true,
       },
+      fs: {
+        allow: [".", "D:/codespace/3dgsWorkspace/gsdata"],
+      },
       port: 8080,
     },
 

@@ -1,18 +1,23 @@
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
-use spark_lib::{chunk_tree, sh_clustering};
 use spark_lib::decoder::{SplatEncoding, SplatGetter, SplatReceiver};
 use spark_lib::rad::RadEncoder;
 use spark_lib::{
+    bhatt_lod,
+    csplat::CsplatArray,
     decoder::{ChunkReceiver, MultiDecoder},
     gsplat::GsplatArray,
-    csplat::CsplatArray,
-    tsplat::{Tsplat, TsplatMut, TsplatArray},
-    tiny_lod,
-    bhatt_lod,
     spz::SpzEncoder,
+    tiny_lod,
+    tsplat::{Tsplat, TsplatArray, TsplatMut},
 };
+use spark_lib::{chunk_tree, sh_clustering};
+
+const MACRO_INDEX_MAGIC: u32 = 0x5844494d; // MIDX
+const MACRO_INDEX_VERSION: u32 = 1;
+const DEFAULT_MACRO_UNIT_PAGES: usize = 16;
 
 #[cfg(feature = "gpu")]
 use crate::gpu_sh_clustering::GpuFindNearestClusters;
@@ -44,8 +49,12 @@ enum BuildLodTsplat {
 
 #[derive(Clone, Copy, Debug, Default)]
 enum BuildLodMethod {
-    TinyLod { lod_base: f32 },
-    BhattLod { lod_base: f32 },
+    TinyLod {
+        lod_base: f32,
+    },
+    BhattLod {
+        lod_base: f32,
+    },
     Quick,
     #[default]
     Quality,
@@ -67,6 +76,7 @@ struct BuildLodOptions {
     cluster_sh: Option<usize>,
     cluster_sh_cpu: bool,
     cluster_sh_f16: Option<bool>,
+    macro_index_only: bool,
 }
 
 fn read_file_chunks(filename: &str, decoder: &mut impl ChunkReceiver) -> anyhow::Result<()> {
@@ -83,12 +93,174 @@ fn read_file_chunks(filename: &str, decoder: &mut impl ChunkReceiver) -> anyhow:
     decoder.finish()
 }
 
+#[derive(Clone, Debug)]
+struct MacroUnitSummary {
+    root: usize,
+    pages: Vec<u32>,
+    min: [f32; 3],
+    max: [f32; 3],
+    s_max: f32,
+    overflow: bool,
+}
+
+fn summarize_macro_subtree<TS: TsplatArray>(
+    splats: &TS,
+    root: usize,
+    max_pages: usize,
+) -> MacroUnitSummary {
+    let mut stack = vec![root];
+    let mut pages = BTreeSet::new();
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut s_max = 0.0f32;
+
+    while let Some(index) = stack.pop() {
+        let page = (index / 65536) as u32;
+        pages.insert(page);
+        if pages.len() > max_pages {
+            return MacroUnitSummary {
+                root,
+                pages: pages.into_iter().collect(),
+                min,
+                max,
+                s_max,
+                overflow: true,
+            };
+        }
+
+        let splat = splats.get(index);
+        let center = splat.center().to_array();
+        let size = splat.feature_size().max(0.0);
+        s_max = s_max.max(size);
+        for axis in 0..3 {
+            min[axis] = min[axis].min(center[axis] - size);
+            max[axis] = max[axis].max(center[axis] + size);
+        }
+
+        let children = splats.get_children(index);
+        for &child in children.iter() {
+            stack.push(child);
+        }
+    }
+
+    MacroUnitSummary {
+        root,
+        pages: pages.into_iter().collect(),
+        min,
+        max,
+        s_max,
+        overflow: false,
+    }
+}
+
+fn collect_macro_units<TS: TsplatArray>(splats: &TS, max_pages: usize) -> Vec<MacroUnitSummary> {
+    if !splats.has_children() || splats.len() == 0 {
+        return Vec::new();
+    }
+
+    let mut units = Vec::new();
+    let mut stack = vec![0usize];
+    while let Some(root) = stack.pop() {
+        let summary = summarize_macro_subtree(splats, root, max_pages);
+        let children = splats.get_children(root);
+        if !summary.overflow || children.is_empty() {
+            units.push(summary);
+            continue;
+        }
+
+        for &child in children.iter().rev() {
+            stack.push(child);
+        }
+    }
+    units
+}
+
+fn write_macro_index<TS: TsplatArray>(
+    output_filename: &str,
+    splats: &TS,
+    max_pages: usize,
+) -> anyhow::Result<()> {
+    let units = collect_macro_units(splats, max_pages);
+    if units.is_empty() {
+        return Ok(());
+    }
+
+    let page_ref_count: usize = units.iter().map(|unit| unit.pages.len()).sum();
+    let filename = format!("{}.macro-index.bin", output_filename);
+    let mut writer = BufWriter::new(File::create(&filename)?);
+
+    writer.write_all(&MACRO_INDEX_MAGIC.to_le_bytes())?;
+    writer.write_all(&MACRO_INDEX_VERSION.to_le_bytes())?;
+    writer.write_all(&(units.len() as u32).to_le_bytes())?;
+    writer.write_all(&(page_ref_count as u32).to_le_bytes())?;
+
+    let mut page_offset = 0u32;
+    for unit in units.iter() {
+        let center = [
+            0.5 * (unit.min[0] + unit.max[0]),
+            0.5 * (unit.min[1] + unit.max[1]),
+            0.5 * (unit.min[2] + unit.max[2]),
+        ];
+        let radius = ((unit.max[0] - center[0]).powi(2)
+            + (unit.max[1] - center[1]).powi(2)
+            + (unit.max[2] - center[2]).powi(2))
+        .sqrt();
+
+        writer.write_all(&(unit.root as u32).to_le_bytes())?;
+        writer.write_all(&page_offset.to_le_bytes())?;
+        writer.write_all(&(unit.pages.len() as u32).to_le_bytes())?;
+        for value in center {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        writer.write_all(&radius.to_le_bytes())?;
+        writer.write_all(&unit.s_max.to_le_bytes())?;
+        page_offset += unit.pages.len() as u32;
+    }
+
+    for unit in units.iter() {
+        for &page in unit.pages.iter() {
+            writer.write_all(&page.to_le_bytes())?;
+        }
+    }
+
+    println!(
+        "Wrote {} ({} macro units, {} page refs, max_pages_per_unit={})",
+        filename,
+        units.len(),
+        page_ref_count,
+        max_pages,
+    );
+    let min_pages = units.iter().map(|unit| unit.pages.len()).min().unwrap_or(0);
+    let max_pages_actual = units.iter().map(|unit| unit.pages.len()).max().unwrap_or(0);
+    let avg_pages = page_ref_count as f64 / units.len().max(1) as f64;
+    let min_s_max = units
+        .iter()
+        .map(|unit| unit.s_max)
+        .fold(f32::INFINITY, f32::min);
+    let max_s_max = units
+        .iter()
+        .map(|unit| unit.s_max)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let avg_s_max =
+        units.iter().map(|unit| unit.s_max as f64).sum::<f64>() / units.len().max(1) as f64;
+    println!(
+        "Macro index stats: pages_per_unit min/avg/max={}/{:.2}/{} s_max min/avg/max={:.6}/{:.6}/{:.6}",
+        min_pages,
+        avg_pages,
+        max_pages_actual,
+        min_s_max,
+        avg_s_max,
+        max_s_max,
+    );
+    Ok(())
+}
+
 fn process_file_lod(filename: &str, options: &BuildLodOptions) {
     match options.tsplat {
         BuildLodTsplat::Gsplat => {
             let splats = GsplatArray::new();
             process_file_lod_tsplat(filename, options, splats)
-        },
+        }
         BuildLodTsplat::Csplat => {
             let splats = CsplatArray::new_encoding(options.splat_encoding.clone());
             process_file_lod_tsplat(filename, options, splats)
@@ -96,7 +268,11 @@ fn process_file_lod(filename: &str, options: &BuildLodOptions) {
     }
 }
 
-fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filename: &str, options: &BuildLodOptions, splats: TS) {
+fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(
+    filename: &str,
+    options: &BuildLodOptions,
+    splats: TS,
+) {
     let mut decoder = MultiDecoder::new(splats, None, Some(&filename));
     let mut splats = match read_file_chunks(&filename, &mut decoder) {
         Ok(_) => {
@@ -114,17 +290,43 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
     let input_splat_count = splats.len();
     let input_sh_degree = TsplatArray::max_sh_degree(&splats);
 
-    println!("Read: num_splats: {} with sh_degree: {}", input_splat_count, input_sh_degree);
-    description.insert("input_splat_count".to_string(), serde_json::Value::Number(input_splat_count.into()));
-    description.insert("input_sh_degree".to_string(), serde_json::Value::Number(input_sh_degree.into()));
+    println!(
+        "Read: num_splats: {} with sh_degree: {}",
+        input_splat_count, input_sh_degree
+    );
+    description.insert(
+        "input_splat_count".to_string(),
+        serde_json::Value::Number(input_splat_count.into()),
+    );
+    description.insert(
+        "input_sh_degree".to_string(),
+        serde_json::Value::Number(input_sh_degree.into()),
+    );
+
+    if options.macro_index_only {
+        if !splats.has_lod_tree() {
+            eprintln!("Cannot write macro index: input does not contain a LoD tree");
+            return;
+        }
+        let mut output_filename = filename.to_string();
+        if output_filename.ends_with(".rad") {
+            output_filename.replace_range(output_filename.len() - 4.., "");
+        }
+        write_macro_index(&output_filename, &splats, DEFAULT_MACRO_UNIT_PAGES).unwrap();
+        return;
+    }
 
     if !options.skip_validate {
         let mut invalid_count = 0;
 
         for index in 0..splats.len() {
             let splat = splats.get(index);
-            if !splat.center().is_finite() || !splat.scales().is_finite() || !splat.quaternion().is_finite() ||
-                !splat.opacity().is_finite() || !splat.rgb().is_finite() || !splat.quaternion().is_finite()
+            if !splat.center().is_finite()
+                || !splat.scales().is_finite()
+                || !splat.quaternion().is_finite()
+                || !splat.opacity().is_finite()
+                || !splat.rgb().is_finite()
+                || !splat.quaternion().is_finite()
             {
                 if invalid_count < 100 {
                     eprintln!("Splat {} not finite: {:?}", index, splat);
@@ -134,7 +336,9 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
         }
         if invalid_count > 0 {
             eprintln!("Found {} invalid splats", invalid_count);
-            eprintln!("Stopping processing due to invalid splats! To continue, use --skip-validate");
+            eprintln!(
+                "Stopping processing due to invalid splats! To continue, use --skip-validate"
+            );
             return;
         }
     }
@@ -146,45 +350,99 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
     splats.retain(|splat| {
         zero_opacity += if splat.opacity() > 0.0 { 0 } else { 1 };
         zero_scale += if splat.max_scale() > 0.0 { 0 } else { 1 };
-        invalid_quat += if splat.quaternion().is_finite() && splat.quaternion().length() > 0.0 { 0 } else { 1 };
-        (splat.opacity() > 0.0) && (splat.max_scale() > 0.0) &&
-        (splat.quaternion().is_finite() && splat.quaternion().length() > 0.0)
+        invalid_quat += if splat.quaternion().is_finite() && splat.quaternion().length() > 0.0 {
+            0
+        } else {
+            1
+        };
+        (splat.opacity() > 0.0)
+            && (splat.max_scale() > 0.0)
+            && (splat.quaternion().is_finite() && splat.quaternion().length() > 0.0)
     });
 
     if input_splat_count != splats.len() {
-        println!("zero_opacity: {}, zero_scale: {}, invalid_quat: {}", zero_opacity, zero_scale, invalid_quat);
-        println!("Removed {} empty splats, remaining splats.len={}", input_splat_count - splats.len(), splats.len());
-        description.insert("empty_splat_count".to_string(), serde_json::Value::Number((input_splat_count - splats.len()).into()));
-        description.insert("initial_splat_count".to_string(), serde_json::Value::Number(splats.len().into()));
+        println!(
+            "zero_opacity: {}, zero_scale: {}, invalid_quat: {}",
+            zero_opacity, zero_scale, invalid_quat
+        );
+        println!(
+            "Removed {} empty splats, remaining splats.len={}",
+            input_splat_count - splats.len(),
+            splats.len()
+        );
+        description.insert(
+            "empty_splat_count".to_string(),
+            serde_json::Value::Number((input_splat_count - splats.len()).into()),
+        );
+        description.insert(
+            "initial_splat_count".to_string(),
+            serde_json::Value::Number(splats.len().into()),
+        );
     }
 
     if let Some(max_sh) = options.max_sh {
         splats.clamp_sh_degree(max_sh);
-        description.insert("clamp_sh_degree".to_string(), serde_json::Value::Number(max_sh.into()));
+        description.insert(
+            "clamp_sh_degree".to_string(),
+            serde_json::Value::Number(max_sh.into()),
+        );
     }
 
     if let Some(min_box) = options.min_box {
         splats.retain(|splat| {
-            splat.center().x >= min_box[0] && splat.center().y >= min_box[1] && splat.center().z >= min_box[2]
+            splat.center().x >= min_box[0]
+                && splat.center().y >= min_box[1]
+                && splat.center().z >= min_box[2]
         });
-        description.insert("min_box".to_string(), serde_json::Value::Array(min_box.iter().map(|&v| serde_json::Number::from_f64(v as f64).into()).collect()));
+        description.insert(
+            "min_box".to_string(),
+            serde_json::Value::Array(
+                min_box
+                    .iter()
+                    .map(|&v| serde_json::Number::from_f64(v as f64).into())
+                    .collect(),
+            ),
+        );
     }
 
     if let Some(max_box) = options.max_box {
         splats.retain(|splat| {
-            splat.center().x <= max_box[0] && splat.center().y <= max_box[1] && splat.center().z <= max_box[2]
+            splat.center().x <= max_box[0]
+                && splat.center().y <= max_box[1]
+                && splat.center().z <= max_box[2]
         });
-        description.insert("max_box".to_string(), serde_json::Value::Array(max_box.iter().map(|&v| serde_json::Number::from_f64(v as f64).into()).collect()));
+        description.insert(
+            "max_box".to_string(),
+            serde_json::Value::Array(
+                max_box
+                    .iter()
+                    .map(|&v| serde_json::Number::from_f64(v as f64).into())
+                    .collect(),
+            ),
+        );
     }
 
     if let Some((origin, dist)) = options.within_dist {
         splats.retain(|splat| {
             let center = splat.center();
-            let dist2 = (center.x - origin[0]).powi(2) + (center.y - origin[1]).powi(2) + (center.z - origin[2]).powi(2);
+            let dist2 = (center.x - origin[0]).powi(2)
+                + (center.y - origin[1]).powi(2)
+                + (center.z - origin[2]).powi(2);
             dist2 <= dist * dist
         });
-        description.insert("within_dist".to_string(), serde_json::Value::Array(origin.iter().map(|&v| serde_json::Number::from_f64(v as f64).into()).collect()));
-        description.insert("within_dist_radius".to_string(), serde_json::Number::from_f64(dist as f64).into());
+        description.insert(
+            "within_dist".to_string(),
+            serde_json::Value::Array(
+                origin
+                    .iter()
+                    .map(|&v| serde_json::Number::from_f64(v as f64).into())
+                    .collect(),
+            ),
+        );
+        description.insert(
+            "within_dist_radius".to_string(),
+            serde_json::Number::from_f64(dist as f64).into(),
+        );
     }
 
     let mut output_filename = filename.to_string();
@@ -199,7 +457,10 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
         let orig_splats_len = splats.len();
         splats.retain_children(|_, children| children.is_empty());
         if orig_splats_len != splats.len() {
-            println!("Removed {} splats with children", orig_splats_len - splats.len());
+            println!(
+                "Removed {} splats with children",
+                orig_splats_len - splats.len()
+            );
         } else {
             println!("Skipping {} because it doesn't have children", filename);
             return;
@@ -209,12 +470,82 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
         description.insert("unlod".to_string(), serde_json::Value::Bool(true));
     }
 
+    if options.output == BuildLodOutput::RadChunked && splats.has_lod_tree() {
+        println!("Re-chunking existing LoD RAD data without rebuilding LoD tree");
+        description.insert(
+            "rechunk_existing_lod".to_string(),
+            serde_json::Value::Bool(true),
+        );
+
+        let mut rechunk_output_filename = filename.to_string();
+        if rechunk_output_filename.ends_with(".rad") {
+            rechunk_output_filename.replace_range(rechunk_output_filename.len() - 4.., "-chunked");
+        } else {
+            rechunk_output_filename.push_str("-chunked");
+        }
+
+        let mut encoder = RadEncoder::new(splats);
+        let input_encoding = serde_json::json!({
+            "center": encoder.center_encoding,
+            "alpha": encoder.alpha_encoding,
+            "rgb": encoder.rgb_encoding,
+            "scales": encoder.scales_encoding,
+            "orientation": encoder.orientation_encoding,
+            "sh": encoder.sh_encoding,
+            "encoding": encoder.encoding,
+            "sh_label": encoder.sh_label_encoding,
+        });
+        description.insert("input_encoding".to_string(), input_encoding);
+
+        encoder.resolve_encoding();
+        let resolved_encoding = serde_json::json!({
+            "center": encoder.center_encoding,
+            "alpha": encoder.alpha_encoding,
+            "rgb": encoder.rgb_encoding,
+            "scales": encoder.scales_encoding,
+            "orientation": encoder.orientation_encoding,
+            "sh": encoder.sh_encoding,
+            "encoding": encoder.encoding,
+            "sh_label": encoder.sh_label_encoding,
+        });
+        description.insert("resolved_encoding".to_string(), resolved_encoding);
+
+        let comment = serde_json::to_string_pretty(&description).unwrap();
+        let mut encoder = encoder.with_comment(comment);
+        let filename_ext = format!("{}.rad", rechunk_output_filename);
+        let mut writer = BufWriter::new(File::create(&filename_ext).unwrap());
+
+        let mut output_path = std::path::PathBuf::from(&rechunk_output_filename);
+        let filename_only = output_path.file_name().unwrap().to_str().unwrap();
+        let chunk_prefix = format!("{}-", filename_only);
+        let chunks = encoder
+            .encode_with_chunks(&mut writer, &chunk_prefix)
+            .unwrap();
+        for (filename, chunk) in chunks {
+            output_path.set_file_name(&filename);
+            let mut chunk_writer = BufWriter::new(File::create(&output_path).unwrap());
+            chunk_writer.write_all(&chunk).unwrap();
+            println!("Wrote {} ({} bytes)", filename, chunk.len());
+        }
+        write_macro_index(
+            &rechunk_output_filename,
+            &encoder.getter,
+            DEFAULT_MACRO_UNIT_PAGES,
+        )
+        .unwrap();
+        println!("Wrote {}", filename_ext);
+        return;
+    }
+
     let method = match options.method.clone() {
         BuildLodMethod::Quick => BuildLodMethod::TinyLod { lod_base: 1.5 },
         BuildLodMethod::Quality => BuildLodMethod::BhattLod { lod_base: 1.75 },
         other => other,
     };
-    description.insert("method".to_string(), serde_json::Value::String(format!("{:?}", method)));
+    description.insert(
+        "method".to_string(),
+        serde_json::Value::String(format!("{:?}", method)),
+    );
 
     let start_time = std::time::Instant::now();
 
@@ -222,29 +553,41 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
         BuildLodMethod::TinyLod { lod_base } => {
             let merge_filter = false;
             tiny_lod::compute_lod_tree(&mut splats, lod_base, merge_filter, |s| println!("{}", s));
-        },
+        }
         BuildLodMethod::BhattLod { lod_base } => {
             bhatt_lod::compute_lod_tree(&mut splats, lod_base, |s| println!("{}", s));
-        },
-        _ => unreachable!()
+        }
+        _ => unreachable!(),
     }
 
     let lod_duration = start_time.elapsed();
-    description.insert("lod_duration".to_string(), serde_json::Number::from_f64(lod_duration.as_secs_f64()).into());
+    description.insert(
+        "lod_duration".to_string(),
+        serde_json::Number::from_f64(lod_duration.as_secs_f64()).into(),
+    );
 
     let final_splat_count = splats.len();
-    description.insert("final_splat_count".to_string(), serde_json::Value::Number(final_splat_count.into()));
+    description.insert(
+        "final_splat_count".to_string(),
+        serde_json::Value::Number(final_splat_count.into()),
+    );
 
     let start_time = std::time::Instant::now();
 
     chunk_tree::chunk_tree(&mut splats, 0, |s| println!("{}", s));
 
     let chunk_duration = start_time.elapsed();
-    description.insert("chunk_duration".to_string(), serde_json::Number::from_f64(chunk_duration.as_secs_f64()).into());
+    description.insert(
+        "chunk_duration".to_string(),
+        serde_json::Number::from_f64(chunk_duration.as_secs_f64()).into(),
+    );
 
     let num_sh = TsplatArray::max_sh_degree(&splats);
-    description.insert("max_sh_degree".to_string(), serde_json::Value::Number(num_sh.into()));
-    
+    description.insert(
+        "max_sh_degree".to_string(),
+        serde_json::Value::Number(num_sh.into()),
+    );
+
     let mut sh_clusters = None;
     if let Some(num_iterations) = options.cluster_sh {
         if num_sh > 0 {
@@ -264,10 +607,10 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
                     ) {
                         Ok(clusters) => {
                             sh_clusters = Some(clusters);
-                        },
+                        }
                         Err(e) => {
                             println!("Error in GPU SH clustering: {}", e);
-                        },
+                        }
                     }
                 } else {
                     println!("GPU SH clustering unavailable");
@@ -288,12 +631,16 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
                     num_clusters,
                     num_iterations,
                     |s| println!("{}", s),
-                ).unwrap();
+                )
+                .unwrap();
                 sh_clusters = Some(clusters);
             }
-            
+
             let sh_cluster_duration = start_time.elapsed();
-            description.insert("sh_cluster_duration".to_string(), serde_json::Number::from_f64(sh_cluster_duration.as_secs_f64()).into());
+            description.insert(
+                "sh_cluster_duration".to_string(),
+                serde_json::Number::from_f64(sh_cluster_duration.as_secs_f64()).into(),
+            );
         }
     }
 
@@ -301,7 +648,7 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
 
     if options.inflate {
         for i in 0..splats.len() {
-            let mut splat = splats.get_mut(i);        
+            let mut splat = splats.get_mut(i);
             if splat.opacity() > 1.0 {
                 let d = splat.opacity() * 4.0 - 3.0;
                 let opacity = ((d * d - 1.0) / std::f32::consts::E).exp();
@@ -354,7 +701,7 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
             let comment = serde_json::to_string_pretty(&description).unwrap();
             println!("Comment: {}", comment);
             let mut encoder = encoder.with_comment(comment);
-            
+
             let filename_ext = format!("{}.rad", output_filename);
             let mut writer = BufWriter::new(File::create(&filename_ext).unwrap());
 
@@ -364,16 +711,20 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
                 let mut output_path = std::path::PathBuf::from(&output_filename);
                 let filename_only = output_path.file_name().unwrap().to_str().unwrap();
                 let chunk_prefix = format!("{}-", filename_only);
-                let chunks = encoder.encode_with_chunks(&mut writer, &chunk_prefix).unwrap();
+                let chunks = encoder
+                    .encode_with_chunks(&mut writer, &chunk_prefix)
+                    .unwrap();
                 for (filename, chunk) in chunks {
                     output_path.set_file_name(&filename);
                     let mut chunk_writer = BufWriter::new(File::create(&output_path).unwrap());
                     chunk_writer.write_all(&chunk).unwrap();
                     println!("Wrote {} ({} bytes)", filename, chunk.len());
                 }
+                write_macro_index(&output_filename, &encoder.getter, DEFAULT_MACRO_UNIT_PAGES)
+                    .unwrap();
             }
             println!("Wrote {}", filename_ext);
-        },
+        }
         BuildLodOutput::Spz => {
             let encoder = SpzEncoder::new(splats);
             let bytes = encoder.encode().unwrap();
@@ -381,23 +732,28 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
             let mut writer = BufWriter::new(File::create(&filename_ext).unwrap());
             writer.write_all(&bytes).unwrap();
             println!("Wrote {} ({} bytes)", filename_ext, bytes.len());
-        },
+        }
         BuildLodOutput::SpzChunked => {
             let num_splats = splats.len();
             let num_chunks = num_splats.div_ceil(65536);
             for chunk in 0..num_chunks {
                 let start = chunk * 65536;
                 let count = (num_splats - start).min(65536);
-                
+
                 let subset = splats.clone_subset(start, count);
                 let encoder = SpzEncoder::new(subset);
                 let bytes = encoder.encode().unwrap();
                 let filename_ext = format!("{}-{}.spz", output_filename, chunk);
                 let mut writer = BufWriter::new(File::create(&filename_ext).unwrap());
                 writer.write_all(&bytes).unwrap();
-                println!("Chunk {}: Wrote {} ({} bytes)", chunk, filename_ext, bytes.len());
+                println!(
+                    "Chunk {}: Wrote {} ({} bytes)",
+                    chunk,
+                    filename_ext,
+                    bytes.len()
+                );
             }
-        },
+        }
     }
 }
 
@@ -407,7 +763,9 @@ fn show_usage_exit() {
     eprintln!("  [--csplat] [--gsplat]                           // Use compact (csplat) or higher-precision (default gsplat) splat encoding");
     eprintln!("  [--quick] [--quality]                           // Use quick (tiny-lod) or quality (bhatt-lod) LoD method (default quality)");
     eprintln!("  [--tiny-lod[=<base>]] [--bhatt-lod[=<base>]]    // Use tiny-lod (default base 1.5) or bhatt-lod (default base 1.75) LoD method");
-    eprintln!("  [--max-sh=<max-sh>]                             // Set maximum SH degree (default 3)");
+    eprintln!(
+        "  [--max-sh=<max-sh>]                             // Set maximum SH degree (default 3)"
+    );
     eprintln!("  [--rad] [--rad-chunked] [--spz] [--spz-chunked] // Output RAD (+chunked) or SPZ (+chunked) output files");
     eprintln!("  [--min-box=<x>,<y>,<z>]                         // Crop input file to minimum bounding coord");
     eprintln!("  [--max-box=<x>,<y>,<z>]                         // Crop input file to maximum bounding coord");
@@ -415,8 +773,11 @@ fn show_usage_exit() {
     eprintln!("  [--skip-validate]                               // Skip validation of input file");
     eprintln!("  [--inflate]                                     // Inflate scales to output normal splat opacity 0..1");
     eprintln!("  [--cluster-sh[=<iterations>]]                   // Cluster SH coefficients into <=64K codebook (default 10 iterations)");
-    eprintln!("  [--cluster-sh-cpu[=<iterations>]]               // Cluster SH coefficients using CPU");
+    eprintln!(
+        "  [--cluster-sh-cpu[=<iterations>]]               // Cluster SH coefficients using CPU"
+    );
     eprintln!("  [--cluster-sh-f16[=auto,true,false]]            // Force GPU SH coefficients to use float16 (default if available)");
+    eprintln!("  [--macro-index-only]                            // Write tree-aligned .macro-index.bin for an existing LoD RAD without rewriting chunks");
     eprintln!("  <file.ply|file.spz|file.compressed.ply|file.splat|file.ksplat|file.sog|file.rad> [...] // Multiple input files and wildcards allowed");
     std::process::exit(1);
 }
@@ -525,7 +886,10 @@ fn main() {
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--min-box=") {
-            let values = rest.split(",").map(|v| v.parse::<f32>().unwrap()).collect::<Vec<f32>>();
+            let values = rest
+                .split(",")
+                .map(|v| v.parse::<f32>().unwrap())
+                .collect::<Vec<f32>>();
             if values.len() != 3 {
                 eprintln!("Invalid --min-box value: {}", rest);
                 show_usage_exit();
@@ -535,7 +899,10 @@ fn main() {
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--max-box=") {
-            let values = rest.split(",").map(|v| v.parse::<f32>().unwrap()).collect::<Vec<f32>>();
+            let values = rest
+                .split(",")
+                .map(|v| v.parse::<f32>().unwrap())
+                .collect::<Vec<f32>>();
             if values.len() != 3 {
                 eprintln!("Invalid --max-box value: {}", rest);
                 show_usage_exit();
@@ -545,7 +912,10 @@ fn main() {
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--within-dist=") {
-            let values = rest.split(",").map(|v| v.parse::<f32>().unwrap()).collect::<Vec<f32>>();
+            let values = rest
+                .split(",")
+                .map(|v| v.parse::<f32>().unwrap())
+                .collect::<Vec<f32>>();
             if values.len() != 4 {
                 eprintln!("Invalid --within-dist value: {}", rest);
                 show_usage_exit();
@@ -562,6 +932,11 @@ fn main() {
         if arg == "--inflate" {
             options.inflate = true;
             println!("Using --inflate: Inflate scales to output normal splat opacity 0..1");
+            continue;
+        }
+        if arg == "--macro-index-only" {
+            options.macro_index_only = true;
+            println!("Using --macro-index-only: Write tree-aligned macro index only");
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--cluster-sh-cpu") {
@@ -586,20 +961,29 @@ fn main() {
         if let Some(rest) = arg.strip_prefix("--cluster-sh-f16") {
             if let Some(rest) = rest.strip_prefix("=") {
                 match rest {
-                    "auto" => { options.cluster_sh_f16 = None; },
-                    "true" => { options.cluster_sh_f16 = Some(true); },
-                    "false" => { options.cluster_sh_f16 = Some(false); },
+                    "auto" => {
+                        options.cluster_sh_f16 = None;
+                    }
+                    "true" => {
+                        options.cluster_sh_f16 = Some(true);
+                    }
+                    "false" => {
+                        options.cluster_sh_f16 = Some(false);
+                    }
                     _ => {
                         eprintln!("Invalid --cluster-sh-f16 value: {}", rest);
                         show_usage_exit();
                     }
                 }
             }
-            println!("Using --cluster-sh-f16={}", match options.cluster_sh_f16 {
-                Some(true) => "true",
-                Some(false) => "false",
-                None => "auto",
-            });
+            println!(
+                "Using --cluster-sh-f16={}",
+                match options.cluster_sh_f16 {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "auto",
+                }
+            );
         }
         if let Some(rest) = arg.strip_prefix("--cluster-sh") {
             if let Some(rest) = rest.strip_prefix("=") {
@@ -639,7 +1023,10 @@ fn main() {
         println!("*** Processing: {}", filename);
 
         if filename.ends_with("-lod.spz") || filename.ends_with("-lod.rad") {
-            if !options.unlod {
+            if !options.unlod
+                && options.output != BuildLodOutput::RadChunked
+                && !options.macro_index_only
+            {
                 println!("Skipping {} because it ends in -lod.*", filename);
                 continue;
             }

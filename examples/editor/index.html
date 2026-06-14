@@ -573,7 +573,7 @@
     lodFolder.add(spark, "behindFoveate", 0.0, 1.0, 0.01).name("Behind Foveate").listen();
     lodFolder.add(spark, "enableDriveLod").name("Enable LoD updates").listen();
     lodFolder.add(spark, "lodInflate").name("Soften LoD splats").listen();
-    lodFolder.add(spark, "lodTraverseMode", ["standard", "dynamic"]).name("LoD traverse mode").listen();
+    lodFolder.add(spark, "lodTraverseMode", ["standard", "macro", "dynamic"]).name("LoD traverse mode").listen();
 
     const pageColoring = dyno.dynoBool(false);
     lodFolder.add(pageColoring, "value").name("Page Coloring").listen().onChange(() => {

@@ -8,7 +8,9 @@ import init_wasm, {
   new_shared_lod_tree,
   init_lod_tree,
   dispose_lod_tree,
+  set_lod_macro_index,
   traverse_lod_trees,
+  macro_traverse_lod_trees,
   dynamic_traverse_lod_trees,
   type ChunkDecoder,
   tiny_lod_packedsplats,
@@ -34,6 +36,7 @@ const rpcHandlers = {
   newSharedLodTree,
   initLodTree,
   disposeLodTree,
+  setLodMacroIndex,
   updateLodTrees,
   traverseLodTrees,
   getLodTreeLevel,
@@ -702,6 +705,16 @@ function disposeLodTree({ lodId }: { lodId: number }) {
   dispose_lod_tree(lodId);
 }
 
+function setLodMacroIndex({
+  lodId,
+  macroIndex,
+}: {
+  lodId: number;
+  macroIndex: Uint8Array;
+}) {
+  return set_lod_macro_index(lodId, macroIndex);
+}
+
 function updateLodTrees({
   ranges,
 }: {
@@ -752,7 +765,7 @@ function traverseLodTrees({
       coneFoveate: number;
     }
   >;
-  traverseMode: "dynamic" | "standard";
+  traverseMode?: "dynamic" | "macro" | "standard";
 }) {
   const keyInstances = Object.entries(instances);
   const lodIds = new Uint32Array(
@@ -788,7 +801,9 @@ function traverseLodTrees({
   const lodFunction =
     traverseMode === "dynamic"
       ? dynamic_traverse_lod_trees
-      : traverse_lod_trees;
+      : traverseMode === "macro"
+        ? macro_traverse_lod_trees
+        : traverse_lod_trees;
   const result = lodFunction(
     maxSplats,
     pixelScaleLimit,
@@ -809,8 +824,30 @@ function traverseLodTrees({
     }[];
     chunks: [number, number][];
     pixelLimit?: number;
+    outputSize?: number;
+    frontierSize?: number;
+    leafCount?: number;
+    macroCoarseChunks?: number;
+    macroActiveChunks?: number;
+    macroUnitsConsidered?: number;
+    macroSeededRoots?: number;
+    macroMissingPageRefs?: number;
+    macroFallbackInstances?: number;
   };
-  const { instanceIndices, chunks, pixelLimit } = result;
+  const {
+    instanceIndices,
+    chunks,
+    pixelLimit,
+    outputSize,
+    frontierSize,
+    leafCount,
+    macroCoarseChunks,
+    macroActiveChunks,
+    macroUnitsConsidered,
+    macroSeededRoots,
+    macroMissingPageRefs,
+    macroFallbackInstances,
+  } = result;
 
   const indices = keyInstances.reduce(
     (indices, [key, _instance], index) => {
@@ -828,6 +865,17 @@ function traverseLodTrees({
     keyIndices: indices,
     chunks,
     pixelLimit,
+    debug: {
+      outputSize,
+      frontierSize,
+      leafCount,
+      macroCoarseChunks,
+      macroActiveChunks,
+      macroUnitsConsidered,
+      macroSeededRoots,
+      macroMissingPageRefs,
+      macroFallbackInstances,
+    },
   };
 }
 

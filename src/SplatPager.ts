@@ -50,6 +50,7 @@ export class PagedSplats implements SplatSource {
   numSplats: number;
   splatEncoding?: SplatEncoding;
   radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
+  macroIndexPromise?: Promise<Uint8Array | undefined>;
 
   dynoNumSplats: dyno.DynoInt<"numSplats">;
   dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
@@ -165,6 +166,37 @@ export class PagedSplats implements SplatSource {
 
   chunkUrl(chunk: number): string {
     return this.rootUrl.replace(/-lod-0\./, `-lod-${chunk}.`);
+  }
+
+  macroIndexUrl(): string {
+    return this.rootUrl.replace(/\.rad($|\?)/, ".macro-index.bin$1");
+  }
+
+  async getMacroIndex(): Promise<Uint8Array | undefined> {
+    if (this.macroIndexPromise) {
+      return this.macroIndexPromise;
+    }
+    if (this.fileType !== SplatFileType.RAD || !this.rootUrl || this.fileBytes) {
+      return undefined;
+    }
+
+    const url = this.macroIndexUrl();
+    this.macroIndexPromise = fetchRange({
+      url,
+      requestHeader: this.requestHeader,
+      withCredentials: this.withCredentials,
+    })
+      .then((bytes) => {
+        console.info(
+          `[Spark LoD] fetched macro index url=${url} bytes=${bytes.byteLength}`,
+        );
+        return bytes;
+      })
+      .catch((error) => {
+        console.info(`No macro index for ${this.rootUrl}: ${error.message}`);
+        return undefined;
+      });
+    return this.macroIndexPromise;
   }
 
   async fetchDecodeChunk(chunk: number) {
